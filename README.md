@@ -2,7 +2,9 @@
 
 This repository provides a complete pipeline for generating, refining, evaluating, and visualizing SAM3-based cardiac segmentation masks on the ACDC dataset.
 
-![Figure 1](Figure_1.png)  
+![Figure 1](Figure_1.png)
+
+**Figure 1.** Visual comparison of cardiac segmentation masks. **SOFT** and **HARD** denote the direct SAM3 outputs obtained using low and high confidence thresholds, respectively. The proposed test-time refinement method (**OPT**) refines these initial predictions, correcting threshold-induced errors and producing more anatomically consistent segmentations.
 
 ## Pipeline Overview
 
