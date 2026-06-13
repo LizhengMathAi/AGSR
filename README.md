@@ -2,6 +2,8 @@
 
 This repository provides a complete pipeline for generating, refining, evaluating, and visualizing SAM3-based cardiac segmentation masks on the ACDC dataset.
 
+![Figure 1](Figure_1.png)  
+
 ## Pipeline Overview
 
 1. Install environment
