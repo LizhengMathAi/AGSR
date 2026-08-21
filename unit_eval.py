@@ -26,6 +26,20 @@ def dice_binary(gt, pred):
     return 2.0 * intersection / denom
 
 
+def iou_binary(first, second):
+    first = first.astype(bool)
+    second = second.astype(bool)
+
+    union = np.logical_or(first, second).sum()
+
+    # Treat two empty masks as a perfect temporal match.
+    if union == 0:
+        return 1.0
+
+    intersection = np.logical_and(first, second).sum()
+    return intersection / union
+
+
 def acdc_mean_dice(gt, pred):
     """
     gt: (H, W) uint8, values in {0, 1, 2, 3}
@@ -161,33 +175,24 @@ def compute_areas(args, patient_id):
                 f.write(line)
 
 
-def compute_neighbor_dices(args, patient_id):
-    """Compute diagonal spatiotemporal Dice around each annotated prediction.
-
-    For a prediction at (z, t), average its Dice against every available mask at
-    (z + p, t + q), where p and q are independently chosen from {-1, 1}.
-    """
+def compute_neighbor_ious(args, patient_id):
+    """Compute class-wise IoU between consecutive predicted frames per slice."""
     gt_dir = Path(args.root_dir) / "masks"
     pred_dir = Path(args.root_dir) / "pseudo_soft_masks"
 
     all_pred_paths = sorted(pred_dir.glob(f"patient{patient_id:03d}_frame*_z*.png"))
-    if not all_pred_paths:
-        raise FileNotFoundError(f"No predictions found for patient {patient_id}")
+    slice_ids = sorted(set(int(p.name.split("_")[2][1:-4]) for p in all_pred_paths))
 
-    def path_key(path):
-        parts = path.stem.split("_")
-        return int(parts[2][1:]), int(parts[1][5:])  # (slice_id, frame_id)
-
-    pred_paths_by_key = {path_key(path): path for path in all_pred_paths}
-    slice_ids = sorted({key[0] for key in pred_paths_by_key})
-    pred_masks = {}
+    total_ious = {
+        "RV": [],
+        "MYO": [],
+        "LV": [],
+        "foreground": [],
+    }
+    processed_slice_ids = []
 
     for slice_id in slice_ids:
-        pred_paths = sorted(
-            (path for key, path in pred_paths_by_key.items() if key[0] == slice_id),
-            key=lambda path: path_key(path)[1],
-        )
-        frame_ids = [path_key(path)[1] for path in pred_paths]
+        pred_paths = sorted(pred_dir.glob(f"patient{patient_id:03d}_frame*_z{slice_id:03d}.png"))
         pred_rgb_seq = np.stack([
             np.array(Image.open(pred_file)).astype(np.uint8)
             for pred_file in pred_paths
@@ -236,101 +241,56 @@ def compute_neighbor_dices(args, patient_id):
                 )
                 pred_seq.append(_rgb2mask(pred_rgb, thres=np.array([0, 0, 0])))
 
-        pred_masks.update({(slice_id, frame_id): mask for frame_id, mask in zip(frame_ids, pred_seq)})
+        slice_ious = {key: [] for key in total_ious}
+        for first, second in zip(pred_seq[:-1], pred_seq[1:]):
+            slice_ious["RV"].append(iou_binary(first == 1, second == 1))
+            slice_ious["MYO"].append(iou_binary(first == 2, second == 2))
+            slice_ious["LV"].append(iou_binary(first == 3, second == 3))
+            slice_ious["foreground"].append(iou_binary(first > 0, second > 0))
 
-    gt_paths = sorted(
-        gt_dir.glob(f"patient{patient_id:03d}_frame*_z*.png"),
-        key=path_key,
-    )
-    if not gt_paths:
-        raise FileNotFoundError(
-            f"Neighbor Dice check requires ground truth for patient {patient_id}"
-        )
+        for key in total_ious:
+            total_ious[key].append(slice_ious[key])
+        processed_slice_ids.append(slice_id)
 
-    total_dices = {"RV": [], "MYO": [], "LV": [], "foreground": []}
-    checks = []
-    sample_ids = []
-
-    for gt_path in gt_paths:
-        current_key = path_key(gt_path)
-        if current_key not in pred_masks:
-            print(f"Missing prediction for {gt_path.name}; skipping")
-            continue
-
-        slice_id, frame_id = current_key
-        current = pred_masks[current_key]
-        neighbor_keys = [
-            (slice_id + p, frame_id + q)
-            for p in (-1, 1)
-            for q in (-1, 1)
-            if (slice_id + p, frame_id + q) in pred_masks
-        ]
-        if not neighbor_keys:
-            print(f"No diagonal neighbors for {gt_path.name}; skipping")
-            continue
-
-        class_specs = {
-            "RV": lambda mask: mask == 1,
-            "MYO": lambda mask: mask == 2,
-            "LV": lambda mask: mask == 3,
-            "foreground": lambda mask: mask > 0,
-        }
-        for name, select in class_specs.items():
-            neighbor_scores = [
-                dice_binary(select(current), select(pred_masks[neighbor_key]))
-                for neighbor_key in neighbor_keys
-            ]
-            total_dices[name].append(float(np.mean(neighbor_scores)))
-
-        gt = np.array(Image.open(gt_path)).astype(np.uint8)
-        gt_presence = [(gt == label).sum() > 0 for label in range(1, 4)]
-        pred_presence = [(current == label).sum() > 0 for label in range(1, 4)]
-        presence_matches = [
-            gt_has_class == pred_has_class
-            for gt_has_class, pred_has_class in zip(gt_presence, pred_presence)
-        ]
-        checks.append(float(np.mean(presence_matches)))
-        sample_ids.append(gt_path.stem)
-
-    mean_dices = {
+    flat_ious = {
+        key: [value for slice_values in values for value in slice_values]
+        for key, values in total_ious.items()
+    }
+    mean_ious = {
         key: np.mean(values) if values else np.nan
-        for key, values in total_dices.items()
+        for key, values in flat_ious.items()
     }
     print(
-        "Overall Mean Diagonal Neighbor Dice: "
-        f"Foreground = {mean_dices['foreground']:.4f}, "
-        f"RV = {mean_dices['RV']:.4f}, "
-        f"MYO = {mean_dices['MYO']:.4f}, "
-        f"LV = {mean_dices['LV']:.4f}"
+        "Overall Mean Neighbor IoUs: "
+        f"Foreground = {mean_ious['foreground']:.4f}, "
+        f"RV = {mean_ious['RV']:.4f}, "
+        f"MYO = {mean_ious['MYO']:.4f}, "
+        f"LV = {mean_ious['LV']:.4f}"
     )
 
-    rows = []
-    for key in ["RV", "MYO", "LV", "foreground"]:
-        values = ", ".join(f"{value:.4f}" for value in total_dices[key])
-        rows.append(f"{key}=[{values}]")
-    rows.append(f"check=[{', '.join(f'{value:.4f}' for value in checks)}]")
-    print("\n".join(rows))
-
-    out_file = Path("./neighbor_dices.txt").resolve()
-    print(f"Saving neighbor Dice to: {out_file}")
+    out_file = Path("./neighbor_ious.txt").resolve()
+    print(f"Saving neighbor IoUs to: {out_file}")
     with open(out_file, "a", encoding="utf-8") as f:
         f.write(f"{args}, patient_id={patient_id}\n")
         f.write(
-            "Overall Mean Diagonal Neighbor Dice: "
-            f"Foreground = {mean_dices['foreground']:.4f}, "
-            f"RV = {mean_dices['RV']:.4f}, "
-            f"MYO = {mean_dices['MYO']:.4f}, "
-            f"LV = {mean_dices['LV']:.4f}\n"
+            "Overall Mean Neighbor IoUs: "
+            f"Foreground = {mean_ious['foreground']:.4f}, "
+            f"RV = {mean_ious['RV']:.4f}, "
+            f"MYO = {mean_ious['MYO']:.4f}, "
+            f"LV = {mean_ious['LV']:.4f}\n"
         )
-        f.write(f"samples=[{', '.join(sample_ids)}]\n")
-        f.write("\n".join(rows) + "\n")
+        for slice_index, slice_id in enumerate(processed_slice_ids):
+            f.write(f"slice={slice_id}\n")
+            for key in ["RV", "MYO", "LV", "foreground"]:
+                values = ", ".join(f"{value:.4f}" for value in total_ious[key][slice_index])
+                f.write(f"{key} = [{values}]\n")
 
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--root-dir", type=str, required=True, help="Root directory of the dataset")
     parser.add_argument("--mode", type=str, default="baseline", choices=["baseline", "self_derived_prompts", "annotation_derived_prompts"], help="Evaluation mode")
     parser.add_argument("--thres", type=float, default=0.0, help="Threshold for binarizing predictions")
-    parser.add_argument("--operation", choices=["dice", "areas", "neighbor_dice"], default="dice", help="Computation to run")
+    parser.add_argument("--operation", choices=["dice", "areas", "neighbor_iou"], default="dice", help="Computation to run")
     parser.add_argument("--patient-id", type=int, default=1, help="Patient used for area or neighbor-IoU computation")
     return parser.parse_args()
 
@@ -339,12 +299,12 @@ if __name__ == "__main__":
     args = parse_args()
     if args.operation == "dice":
         compute_dice_scores(args)
-    elif args.operation == "neighbor_dice":
-        compute_neighbor_dices(args, patient_id=args.patient_id)
+    elif args.operation == "neighbor_iou":
+        compute_neighbor_ious(args, patient_id=args.patient_id)
     else:
         compute_areas(args, patient_id=args.patient_id)
 
-    # NOTE: compute the dice, area, and neighbor_dice respectively.
+    # NOTE: compute the dice, area, and neighbor_iou respectivily.
     # python unit_eval.py --root-dir ./acdc_train --mode baseline --thres 0.0
     # python unit_eval.py --root-dir ./acdc_train --mode baseline --thres 0.0 --operation areas --patient-id 1
-    # python unit_eval.py --root-dir ./acdc_train --mode baseline --thres 0.0 --operation neighbor_dice --patient-id 1
+    # python unit_eval.py --root-dir ./acdc_train --mode baseline --thres 0.0 --operation neighbor_iou --patient-id 1
